@@ -1,3 +1,4 @@
+import ginkgo
 from sklearn.preprocessing import StandardScaler
 import umap
 import umap.plot as uplot
@@ -15,78 +16,141 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Define Drug Response dataset
 class CLinesDataset(data.Dataset):
-    def __init__(self, csv_file):
-        self.df = pd.read_csv(csv_file, index_col=0).T
+    def __init__(self, gexp_csv_file, prot_csv_file):
+        # Read csv files
+        self.df_gexp = pd.read_csv(gexp_csv_file, index_col=0).T
+        self.df_prot = pd.read_csv(prot_csv_file, index_col=0).T
 
+        # Union samples
+        self.samples = list(set(self.df_gexp.index).union(set(self.df_prot.index)))
+        self.df_gexp = self.df_gexp.reindex(index=self.samples)
+        self.df_prot = self.df_prot.reindex(index=self.samples)
+
+        # Parse the data
+        self.x_gexp, self.scaler_gexp = self.process_df(self.df_gexp)
+        self.x_prot, self.scaler_prot = self.process_df(self.df_prot)
+
+        # Datasets list
+        self.views = [self.x_gexp, self.x_prot]
+
+    def process_df(self, df):
         # Normalize the data using StandardScaler
-        self.scaler = StandardScaler()
-        self.X = self.scaler.fit_transform(self.df.values)
-        self.X = np.nan_to_num(self.X, copy=False)
+        scaler = StandardScaler()
+        x = scaler.fit_transform(df)
+        x = np.nan_to_num(x, copy=False)
 
-        self.X = torch.tensor(self.X, dtype=torch.float)
+        # Convert to tensor
+        x = torch.tensor(x, dtype=torch.float)
+
+        return x, scaler
 
     def __len__(self):
-        return len(self.X)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        return self.X[idx]
+        return self.x_gexp[idx], self.x_prot[idx]
 
 
 # Define the VAE model
 class ClinesVAE(nn.Module):
-    def __init__(self, input_dim, hidden_dim, latent_dim):
+    def __init__(self, views, hidden_dim, latent_dim):
         super().__init__()
-        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
 
         # Encoder layers
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
+        self.view_encoders = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(v.shape[1], hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, latent_dim * 2),
+                )
+                for v in views
+            ]
         )
-        self.encoder_mu = nn.Linear(hidden_dim, latent_dim)
-        self.encoder_sd = nn.Linear(hidden_dim, latent_dim)
 
         # Decoder layers
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim),
+        self.view_decoders = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(latent_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, v.shape[1]),
+                )
+                for v in views
+            ]
         )
 
-    def encode(self, x):
-        h1 = self.encoder(x)
+    def poe(self, mus, logvars):
+        # formula (prior var = 1): var_joint = inv(inv(var_prior) + sum(inv(var_modalities)))
+        logvar_joint = torch.sum(
+            torch.stack([1.0 / torch.exp(log_var) for log_var in logvars]), dim=0
+        )
+        logvar_joint = torch.log(1.0 / logvar_joint)
 
-        mu = self.encoder_mu(h1)
-        sd = self.encoder_sd(h1)
+        # formula (prior mu = 0): mu_joint = (mu_prior*inv(var_prior) + sum(mu_modalities*inv(var_modalities))) * var_joint
+        mu_joint = torch.sum(
+            torch.stack([mu / torch.exp(log_var) for mu, log_var in zip(mus, logvars)]),
+            dim=0,
+        )
+        mu_joint = mu_joint * torch.exp(logvar_joint)
 
-        z = self.reparameterize(mu, sd)
-
-        kl = -0.5 * torch.sum(1 + sd - mu.pow(2) - sd.exp())
-
-        return z, mu, sd, kl
+        return mu_joint, logvar_joint
 
     def reparameterize(self, mu, sd):
         std = torch.exp(0.5 * sd)
         eps = torch.randn_like(std)
         return mu + eps * std
 
+    def encode(self, views):
+        mus, log_vars = [], []
+
+        for v, e in zip(views, self.view_encoders):
+            h = e(v)
+            mus.append(h[:, : self.latent_dim])
+            log_vars.append(h[:, self.latent_dim :])
+
+        return mus, log_vars
+
     def decode(self, z):
-        return self.decoder(z)
+        return [d(z) for d in self.view_decoders]
 
-    def forward(self, x):
+    def forward(self, views):
         # Encode the input and then decode it
-        z, mu, sd, kl = self.encode(x)
+        mus, logvars = self.encode(views)
+
+        # Product of experts
+        mu_joint, logvar_joint = self.poe(mus, logvars)
+
+        # Reparameterize
+        z = self.reparameterize(mu_joint, logvar_joint)
+
+        # Decode
         x_hat = self.decode(z)
-        return x_hat, mu, sd, kl
+
+        return x_hat, mu_joint, logvar_joint
 
 
-def mse_kl(x_hat, x, mu, logvar, alpha=0.1):
-    mse_loss = torch.nn.functional.mse_loss(x_hat, x, reduction="sum")
-    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    loss = (mse_loss + alpha * kl_loss) / x.size(0)
-    return loss, mse_loss / x.size(0), (alpha * kl_loss) / x.size(0)
+def mse_kl(views_hat, views, mu_joint, logvar_joint, alpha=0.1):
+    # Number of samples in the batch
+    n = views[0].size(0)
+
+    # Compute the MSE loss
+    mse_loss = sum(
+        [
+            torch.nn.functional.mse_loss(x_hat, x, reduction="sum")
+            for x, x_hat in zip(views, views_hat)
+        ]
+    )
+
+    # Compute the KL loss
+    kl_loss = -0.5 * torch.sum(1 + logvar_joint - mu_joint.pow(2) - logvar_joint.exp())
+
+    # Compute the total loss
+    loss = (mse_loss + alpha * kl_loss) / n
+
+    return loss, mse_loss / n, (alpha * kl_loss) / n
 
 
 def clines_labels(clabel):
@@ -108,44 +172,54 @@ def clines_labels(clabel):
 
 if __name__ == "__main__":
     # Load the first dataset
-    gexp = CLinesDataset("data/clines/transcriptomics.csv")
+    clines_db = CLinesDataset(
+        gexp_csv_file="data/clines/transcriptomics.csv",
+        prot_csv_file="data/clines/proteomics.csv",
+    )
 
     # Create a data loader for the dataset
-    dataloader = data.DataLoader(gexp, batch_size=128, shuffle=True)
+    dataloader = data.DataLoader(clines_db, batch_size=128, shuffle=True)
 
     # Create the VAE model
-    model = ClinesVAE(gexp.X.shape[1], 2048, 32)
+    model = ClinesVAE(clines_db.views, 1024, 2)
 
     # Train
     epochs = 100
     optimizer = optim.Adam(model.parameters(), lr=1e-5, weight_decay=1e-5)
 
     for epoch in range(epochs):
-        for x in dataloader:
-            x_hat, mu, sd, kl = model.forward(x)
+        for views in dataloader:
+            x_hat, mu_joint, logvar_joint = model.forward(views)
 
-            vae_loss, reconstruction_loss, kl_loss = mse_kl(x_hat, x, mu, sd, 0.0001)
+            vae_loss, reconstruction_loss, kl_loss = mse_kl(
+                x_hat, views, mu_joint, logvar_joint, 0.0001
+            )
             loss = vae_loss + reconstruction_loss + kl_loss
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            print(f"Epoch: {epoch}, Loss: {loss.item()}")
+            print(
+                f"Epoch: {epoch}, Loss: {loss.item()}, VAE Loss: {vae_loss.item()}, Reconstruction Loss: {reconstruction_loss.item()}, KL Loss: {kl_loss.item()}"
+            )
 
     # Plot latent space
     ss = pd.read_csv("data/clines/cmp_model_list_20221102.csv", index_col=0)
 
-    z = pd.DataFrame(model.encode(gexp.X)[0].detach().numpy(), index=gexp.df.index)
-
-    z_umap = pd.DataFrame(
-        umap.UMAP(n_neighbors=15, min_dist=0.1, metric="correlation").fit_transform(z),
-        index=z.index,
+    z = pd.DataFrame(
+        model.poe(*model.encode(clines_db.views))[0].detach().numpy(),
+        index=clines_db.samples,
     )
+
+    # z_umap = pd.DataFrame(
+    #     umap.UMAP(n_neighbors=15, min_dist=0.1, metric="correlation").fit_transform(z),
+    #     index=z.index,
+    # )
 
     df = pd.concat(
         [
-            z_umap,
+            z,
             ss["tissue"].reindex(z.index).apply(lambda v: clines_labels(v)),
         ],
         axis=1,
